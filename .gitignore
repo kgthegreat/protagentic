@@ -1,0 +1,38 @@
+# Compiled Emacs Lisp files
+*.elc
+
+# Package build artifacts
+*.tar
+protagentic-*/
+
+# Temporary files
+*~
+\#*\#
+.\#*
+
+# Test artifacts
+.protagentic/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backup files
+*.bak
+*.orig
+
+# Log files
+*.log
+
+# Coverage reports
+coverage/
+
+# Documentation build artifacts
+docs/_build/
+docs/.doctrees/
