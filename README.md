@@ -4,6 +4,9 @@
 
 Protagentic is an Emacs plugin that guides developers through systematic feature planning using a three-phase workflow: requirements gathering, design documentation, and implementation task generation. Transform rough ideas into actionable development plans without leaving your editor.
 
+**Story behind Protagentic**
+[How I made Protagentic - a Kiro like plugin for emacs](https://youtu.be/jC4hBqt6vwg)
+
 ## Features
 
 - 📝 **Requirements Phase**: Generate user stories and acceptance criteria in EARS format
