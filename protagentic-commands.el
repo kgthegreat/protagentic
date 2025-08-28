@@ -908,3 +908,178 @@ Saves the updated content and provides completion feedback."
 (provide 'protagentic-commands)
 
 ;;; protagentic-commands.el ends here
+
+;;;###autoload
+(defun protagentic-execute-next-task (spec-name)
+  "Execute the next pending task for SPEC-NAME.
+Generates code files based on the task requirements and design."
+  (interactive (list (protagentic--read-spec-name "Execute task for spec: ")))
+  
+  (let ((spec (protagentic--create-spec-struct spec-name)))
+    (unless spec
+      (error "Spec '%s' not found" spec-name))
+    
+    ;; Validate that tasks exist
+    (unless (protagentic--file-exists-p (protagentic-spec-tasks-file spec))
+      (error "No tasks file found. Generate tasks first with M-x protagentic-generate-tasks"))
+    
+    (require 'protagentic-executor)
+    (let ((result (protagentic-executor-execute-next-task spec)))
+      (if result
+          (message "✓ Task completed successfully. Generated files: %s"
+                   (string-join (protagentic-task-generated-files result) ", "))
+        (message "All tasks completed or execution failed")))))
+
+;;;###autoload
+(defun protagentic-execute-all-tasks (spec-name)
+  "Execute all pending tasks for SPEC-NAME.
+Generates complete project implementation based on tasks."
+  (interactive (list (protagentic--read-spec-name "Execute all tasks for spec: ")))
+  
+  (let ((spec (protagentic--create-spec-struct spec-name)))
+    (unless spec
+      (error "Spec '%s' not found" spec-name))
+    
+    ;; Validate that tasks exist
+    (unless (protagentic--file-exists-p (protagentic-spec-tasks-file spec))
+      (error "No tasks file found. Generate tasks first with M-x protagentic-generate-tasks"))
+    
+    (require 'protagentic-executor)
+    (let ((completed-count 0)
+          (failed-count 0)
+          (max-iterations 20)) ; Prevent infinite loops
+      
+      (message "Starting execution of all tasks...")
+      
+      (cl-block execution-loop
+        (dotimes (i max-iterations)
+          (let ((result (condition-case err
+                            (protagentic-executor-execute-next-task spec)
+                          (error 
+                           (message "✗ Task execution error: %s" (error-message-string err))
+                           nil))))
+            (cond
+             (result
+              (cl-incf completed-count)
+              (message "Progress: %d tasks completed" completed-count))
+             
+             ((protagentic-executor--has-pending-tasks-p spec)
+              (cl-incf failed-count)
+              (message "⚠ Task failed, continuing with next task"))
+             
+             (t
+              (message "✓ All tasks completed! Generated files for %d tasks" completed-count)
+              (cl-return-from execution-loop))))))
+      
+      (when (> failed-count 0)
+        (message "⚠ Completed %d tasks, %d failed. Check logs for details" 
+                 completed-count failed-count))))
+
+;;;###autoload
+(defun protagentic-validate-code-quality (spec-name)
+  "Validate code quality for generated files in SPEC-NAME."
+  (interactive (list (protagentic--read-spec-name "Validate code quality for spec: ")))
+  
+  (let ((spec (protagentic--create-spec-struct spec-name)))
+    (unless spec
+      (error "Spec '%s' not found" spec-name))
+    
+    (require 'protagentic-quality)
+    (let* ((project-root (protagentic--detect-project-root))
+           (generated-files (protagentic-executor--get-generated-files spec))
+           (total-errors 0)
+           (total-warnings 0))
+      
+      (if generated-files
+          (progn
+            (with-output-to-temp-buffer "*Protagentic Quality Report*"
+              (princ (format "Code Quality Report for '%s'\n" spec-name))
+              (princ "=====================================\n\n")
+              
+              (dolist (file generated-files)
+                (let ((file-path (expand-file-name file project-root)))
+                  (when (file-exists-p file-path)
+                    (let ((result (protagentic-quality-check-file file-path)))
+                      (when result
+                        (let ((errors (plist-get result :errors))
+                              (warnings (plist-get result :warnings))
+                              (score (plist-get result :score)))
+                          
+                          (princ (format "File: %s (Score: %d/100)\n" file score))
+                          (princ "----------------------------------------\n")
+                          
+                          (when errors
+                            (princ "ERRORS:\n")
+                            (dolist (error errors)
+                              (princ (format "  ✗ %s\n" error)))
+                            (princ "\n"))
+                          
+                          (when warnings
+                            (princ "WARNINGS:\n")
+                            (dolist (warning warnings)
+                              (princ (format "  ⚠ %s\n" warning)))
+                            (princ "\n"))
+                          
+                          (setq total-errors (+ total-errors (length errors)))
+                          (setq total-warnings (+ total-warnings (length warnings)))
+                          
+                          (princ "\n")))))))
+              
+              (princ (format "SUMMARY: %d errors, %d warnings across %d files\n"
+                             total-errors total-warnings (length generated-files)))
+              
+              (if (= total-errors 0)
+                  (princ "✓ No critical issues found!")
+                (princ "✗ Critical issues need to be addressed before deployment")))
+            
+            (message "Quality validation complete. See *Protagentic Quality Report* for details"))
+        
+        (message "No generated files found for spec '%s'" spec-name))))
+
+;;;###autoload
+(defun protagentic-show-task-status (spec-name)
+  "Show task execution status for SPEC-NAME."
+  (interactive (list (protagentic--read-spec-name "Show task status for spec: ")))
+  
+  (let ((spec (protagentic--create-spec-struct spec-name)))
+    (unless spec
+      (error "Spec '%s' not found" spec-name))
+    
+    (unless (protagentic--file-exists-p (protagentic-spec-tasks-file spec))
+      (error "No tasks file found for spec '%s'" spec-name))
+    
+    (require 'protagentic-executor)
+    (let ((tasks (protagentic-executor--get-tasks spec)))
+      (with-output-to-temp-buffer "*Protagentic Task Status*"
+        (princ (format "Task Status for '%s'\n" spec-name))
+        (princ "========================\n\n")
+        
+        (let ((pending 0) (completed 0) (failed 0))
+          (dolist (task tasks)
+            (let ((status (protagentic-task-status task))
+                  (id (protagentic-task-id task))
+                  (desc (protagentic-task-description task)))
+              
+              (pcase status
+                ('pending 
+                 (cl-incf pending)
+                 (princ (format "⏳ Task %d: %s\n" id desc)))
+                ('completed 
+                 (cl-incf completed)
+                 (princ (format "✓ Task %d: %s\n" id desc))
+                 (let ((files (protagentic-task-generated-files task)))
+                   (when files
+                     (princ (format "   Generated: %s\n" (string-join files ", "))))))
+                ('failed 
+                 (cl-incf failed)
+                 (princ (format "✗ Task %d: %s\n" id desc))))))
+          
+          (princ (format "\nSUMMARY: %d completed, %d pending, %d failed\n"
+                         completed pending failed))
+          
+          (when (> pending 0)
+            (princ "\nNext: Run M-x protagentic-execute-next-task to continue\n")))))))))
+
+(provide 'protagentic-commands)
+
+;;; protagentic-commands.el ends here
