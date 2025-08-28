@@ -273,30 +273,43 @@ Generate all necessary files to complete this task."
   "Parse GENERATED-CODE into list of (filename . content) pairs."
   (message "🔍 DEBUG: Starting file parsing...")
   (message "🔍 DEBUG: Generated code length: %d characters" (length generated-code))
-  (message "🔍 DEBUG: First 500 chars: %s" (substring generated-code 0 (min 500 (length generated-code))))
-  (message "🔍 DEBUG: Full response: %s" generated-code)
   
   (let ((files '())
         (start 0))
-    ;; Try multiple patterns to handle different LLM response formats
-    (let ((patterns '(
-                     ;; Common pattern: **filename.ext**\n```language (with optional language)
-                     "\\*\\*\\([^*]+\\.[a-zA-Z0-9]+\\)\\*\\*[[:space:]]*\n```[a-zA-Z0-9]*[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)```"
-                     ;; Pattern without language specifier: **filename.ext**\ncode
-                     "\\*\\*\\([^*]+\\.[a-zA-Z0-9]+\\)\\*\\*[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)(?=\\*\\*\\|$)"
-                     ;; Pattern with explicit language: **filename.ext**\n```javascript
-                     "\\*\\*\\([^*]+\\.[a-zA-Z0-9]+\\)\\*\\*[[:space:]]*\n```[a-zA-Z0-9]+[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)```")))
-      (dolist (pattern patterns)
-        (setq start 0)
-        (message "🔍 DEBUG: Trying pattern: %s" (substring pattern 0 (min 50 (length pattern))))
-        (while (string-match pattern generated-code start)
-          (let ((filename (string-trim (match-string 1 generated-code)))
-                (file-content (string-trim (match-string 2 generated-code))))
-            (message "🔍 DEBUG: Found file: %s (content length: %d)" filename (length file-content))
-            ;; Skip if we already have this file
-            (unless (assoc filename files)
-              (push (cons filename file-content) files))
-            (setq start (match-end 0))))))
+    
+    ;; Find all **filename** markers first
+    (let ((file-positions '()))
+      (while (string-match "\\*\\*\\([^*]+\\.[a-zA-Z0-9]+\\)\\*\\*" generated-code start)
+        (let ((filename (match-string 1 generated-code))
+              (pos (match-end 0)))
+          (push (cons filename pos) file-positions)
+          (setq start (match-end 0))))
+      
+      (setq file-positions (nreverse file-positions))
+      (message "🔍 DEBUG: Found %d file markers" (length file-positions))
+      
+      ;; Extract content between markers
+      (dotimes (i (length file-positions))
+        (let* ((current-file (nth i file-positions))
+               (next-file (nth (1+ i) file-positions))
+               (filename (car current-file))
+               (content-start (cdr current-file))
+               (content-end (if next-file 
+                               (- (cdr next-file) (length (format "**%s**" (car next-file))))
+                             (length generated-code)))
+               (content (substring generated-code content-start content-end)))
+          
+          ;; Clean up content - remove leading/trailing whitespace and empty lines
+          (setq content (string-trim content))
+          (when (string-match "^```[a-zA-Z0-9]*\n" content)
+            (setq content (substring content (match-end 0))))
+          (when (string-match "\n```$" content)
+            (setq content (substring content 0 (match-beginning 0))))
+          (setq content (string-trim content))
+          
+          (when (> (length content) 0)
+            (message "🔍 DEBUG: Found file: %s (content length: %d)" filename (length content))
+            (push (cons filename content) files)))))
     
     (message "🔍 DEBUG: Total files parsed: %d" (length files))
     (dolist (file files)
