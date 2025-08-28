@@ -98,27 +98,6 @@ Returns cons cell (details . requirements-refs)."
     
     (cons (reverse details) requirements-refs)))
 
-(defun protagentic-executor--extract-task-details ()
-  "Extract task details from current buffer position.
-Returns list of detail strings."
-  (car (protagentic-executor--extract-task-details-and-refs)))
-
-(defun protagentic-executor--extract-requirements-refs ()
-  "Extract requirements references from current task.
-Returns list of requirement IDs."
-  (let ((refs '())
-        (start-pos (point)))
-    (save-excursion
-      ;; Look ahead to find the end of this task (next task or end of buffer)
-      (let ((end-pos (if (re-search-forward "^- \\[" nil t)
-                         (line-beginning-position)
-                       (point-max))))
-        (goto-char start-pos)
-        (while (re-search-forward "_Requirements: \\([0-9., ]+\\)_" end-pos t)
-          (let ((ref-string (match-string 1)))
-            (setq refs (append refs (split-string ref-string "[, ]+" t)))))))
-    refs))
-
 ;; Main execution function
 (defun protagentic-executor-execute-next-task (&optional spec)
   "Execute the next pending task for SPEC.
@@ -156,7 +135,7 @@ If SPEC is not provided, finds the current spec automatically."
                 nil)))) ; Return nil on failure
       (progn
         (message "🎉 All tasks completed!")
-        nil)))) ; Return nil when no more tasks))
+        nil)))) ; Return nil when no more tasks
 
 ;; Helper functions
 (defun protagentic-executor--get-tasks (spec)
@@ -203,17 +182,28 @@ Returns execution result structure."
       (let* ((prompt (protagentic-executor--build-code-generation-prompt task context))
              (generated-code (protagentic-llm-generate-content prompt 'tasks context)))
         
+        (message "🔧 DEBUG: Generated code length: %d" (if generated-code (length generated-code) 0))
+        
         (if generated-code
             (let* ((files (protagentic-executor--parse-generated-files generated-code))
                    (validation-result (protagentic-executor--validate-generated-code files context)))
               
+              (message "🔧 DEBUG: Parsed %d files from LLM response" (length files))
+              (message "🔧 DEBUG: Validation passed: %s" (protagentic-executor--validation-passed-p validation-result))
+              
               (if (protagentic-executor--validation-passed-p validation-result)
                   (progn
+                    (message "🔧 DEBUG: Writing files to disk...")
                     (protagentic-executor--write-generated-files files context)
                     (protagentic-executor--update-task-status task 'completed)
+                    (message "🔧 DEBUG: Task marked as completed")
                     (list :success t :files files))
-                (list :success nil :error (protagentic-executor--get-validation-errors validation-result))))
-          (list :success nil :error "Failed to generate code")))
+                (progn
+                  (message "❌ DEBUG: Validation failed: %s" (protagentic-executor--get-validation-errors validation-result))
+                  (list :success nil :error (protagentic-executor--get-validation-errors validation-result)))))
+          (progn
+            (message "❌ DEBUG: No generated code received from LLM")
+            (list :success nil :error "Failed to generate code"))))
     (error
      (list :success nil :error (format "Execution error: %s" (error-message-string err))))))
 
@@ -281,65 +271,38 @@ Generate all necessary files to complete this task."
 
 (defun protagentic-executor--parse-generated-files (generated-code)
   "Parse GENERATED-CODE into list of (filename . content) pairs."
+  (message "🔍 DEBUG: Starting file parsing...")
+  (message "🔍 DEBUG: Generated code length: %d characters" (length generated-code))
+  (message "🔍 DEBUG: First 500 chars: %s" (substring generated-code 0 (min 500 (length generated-code))))
+  (message "🔍 DEBUG: Full response: %s" generated-code)
+  
   (let ((files '())
         (start 0))
     ;; Try multiple patterns to handle different LLM response formats
     (let ((patterns '(
-                     ;; Primary format: ```filename: path/file.ext
-                     "```filename: *\\([^\\n\\r]+\\) *[\\n\\r]+\\(\\(?:.\\|[\\n\\r]\\)*?\\)```"
-                     ;; Language with comment filename: ```javascript\\n// filename: path/file.ext
-                     "```[a-zA-Z0-9]+ *[\\n\\r]+// *filename: *\\([^\\n\\r]+\\) *[\\n\\r]+\\(\\(?:.\\|[\\n\\r]\\)*?\\)```"
-                     ;; Language with comment filename (# style): ```python\\n# filename: path/file.ext  
-                     "```[a-zA-Z0-9]+ *[\\n\\r]+# *filename: *\\([^\\n\\r]+\\) *[\\n\\r]+\\(\\(?:.\\|[\\n\\r]\\)*?\\)```"
-                     ;; Common pattern: **filename.ext**\n```language
+                     ;; Common pattern: **filename.ext**\n```language (with optional language)
                      "\\*\\*\\([^*]+\\.[a-zA-Z0-9]+\\)\\*\\*[[:space:]]*\n```[a-zA-Z0-9]*[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)```"
-                     ;; Pattern: `filename.ext`\n```language
-                     "`\\([^`]+\\.[a-zA-Z0-9]+\\)`[[:space:]]*\n```[a-zA-Z0-9]*[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)```"
-                     ;; Pattern: ### filename.ext or ## filename.ext
-                     "#+\\s-*\\([^\\n\\r]+\\.[a-zA-Z0-9]+\\) *[\\n\\r]+```[a-zA-Z0-9]* *[\\n\\r]+\\(\\(?:.\\|[\\n\\r]\\)*?\\)```"
-                     ;; Pattern: Create file: filename.ext
-                     "[Cc]reate[^\n]*:[[:space:]]*\\([^\n]+\\.[a-zA-Z0-9]+\\)[[:space:]]*\n[[:space:]]*```[a-zA-Z0-9]*[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)```"
-                     ;; Pattern: File: filename.ext
-                     "[Ff]ile:[[:space:]]*\\([^\n]+\\.[a-zA-Z0-9]+\\)[[:space:]]*\n```[a-zA-Z0-9]*[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)```")))
+                     ;; Pattern without language specifier: **filename.ext**\ncode
+                     "\\*\\*\\([^*]+\\.[a-zA-Z0-9]+\\)\\*\\*[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)(?=\\*\\*\\|$)"
+                     ;; Pattern with explicit language: **filename.ext**\n```javascript
+                     "\\*\\*\\([^*]+\\.[a-zA-Z0-9]+\\)\\*\\*[[:space:]]*\n```[a-zA-Z0-9]+[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)```")))
       (dolist (pattern patterns)
         (setq start 0)
+        (message "🔍 DEBUG: Trying pattern: %s" (substring pattern 0 (min 50 (length pattern))))
         (while (string-match pattern generated-code start)
           (let ((filename (string-trim (match-string 1 generated-code)))
                 (file-content (string-trim (match-string 2 generated-code))))
+            (message "🔍 DEBUG: Found file: %s (content length: %d)" filename (length file-content))
             ;; Skip if we already have this file
             (unless (assoc filename files)
               (push (cons filename file-content) files))
             (setq start (match-end 0))))))
     
-    ;; If no files found with patterns, try to extract from tool calls
-    (when (null files)
-      (setq files (protagentic-executor--parse-tool-calls generated-code)))
+    (message "🔍 DEBUG: Total files parsed: %d" (length files))
+    (dolist (file files)
+      (message "🔍 DEBUG: File: %s" (car file)))
     
     (nreverse files)))
-
-(defun protagentic-executor--parse-tool-calls (generated-code)
-  "Parse tool calls like fsWrite from GENERATED-CODE.
-Returns list of (filename . content) pairs."
-  (let ((files '())
-        (start 0))
-    ;; Look for fsWrite tool calls - pattern matches XML-style tool calls
-    (while (string-match "<invoke name=\"fsWrite\">\\s-*<parameter name=\"path\">\\([^<]+\\)</parameter>\\s-*<parameter name=\"text\">\\(\\(?:.\\|\n\\)*?\\)</parameter>\\s-*</invoke>" generated-code start)
-      (let ((filename (string-trim (match-string 1 generated-code)))
-            (file-content (string-trim (match-string 2 generated-code))))
-        (unless (assoc filename files)
-          (push (cons filename file-content) files))
-        (setq start (match-end 0))))
-    
-    ;; Also look for simple file creation patterns in text
-    (setq start 0)
-    (while (string-match "I'll create \\([^\\s-]+\\.[a-zA-Z0-9]+\\):\\s-*\n\n```[a-zA-Z0-9]*\n\\(\\(?:.\\|\n\\)*?\\)\n```" generated-code start)
-      (let ((filename (string-trim (match-string 1 generated-code)))
-            (file-content (string-trim (match-string 2 generated-code))))
-        (unless (assoc filename files)
-          (push (cons filename file-content) files))
-        (setq start (match-end 0))))
-    
-    files))
 
 (defun protagentic-executor--validate-generated-code (files context)
   "Validate FILES against code quality standards in CONTEXT.
@@ -365,21 +328,38 @@ Returns validation result structure."
 (defun protagentic-executor--write-generated-files (files context)
   "Write generated FILES using CONTEXT."
   (let ((project-root (protagentic-execution-context-project-root context)))
+    (message "📁 DEBUG: Project root: %s" project-root)
+    (message "📁 DEBUG: Writing %d files..." (length files))
+    
     (dolist (file files)
       (let* ((filename (car file))
              (content (cdr file))
              (full-path (expand-file-name filename project-root)))
         
-        ;; Create directory if it doesn't exist
+        (message "📁 DEBUG: Processing file: %s" filename)
+        (message "📁 DEBUG: Full path: %s" full-path)
+        (message "📁 DEBUG: Content length: %d" (length content))
+        
+        ;; Create directory if needed
         (let ((dir (file-name-directory full-path)))
-          (unless (file-exists-p dir)
-            (make-directory dir t)))
+          (message "📁 DEBUG: Directory: %s" dir)
+          (unless (file-directory-p dir)
+            (message "📁 DEBUG: Creating directory: %s" dir)
+            (make-directory dir t))
+          (message "📁 DEBUG: Directory exists: %s" (file-directory-p dir)))
         
         ;; Write file
-        (with-temp-file full-path
-          (insert content))
-        
-        (message "Generated: %s" filename)))))
+        (condition-case err
+            (progn
+              (message "📁 DEBUG: Writing file...")
+              (with-temp-file full-path
+                (insert content))
+              (message "✅ Generated file: %s" full-path)
+              (message "✅ File exists after write: %s" (file-exists-p full-path))
+              (when (file-exists-p full-path)
+                (message "✅ File size: %d bytes" (nth 7 (file-attributes full-path)))))
+          (error
+           (message "❌ ERROR writing file %s: %s" full-path (error-message-string err))))))))
 
 (defun protagentic-executor--update-task-status (task new-status)
   "Update TASK status to NEW-STATUS."
