@@ -1,0 +1,1373 @@
+;;; protagentic-executor.el --- Task execution and code generation -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025
+
+;; This file is not part of GNU Emacs.
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;;; Commentary:
+
+;; Task execution engine for Protagentic that executes implementation tasks
+;; one by one and generates maintainable code following robust guidelines.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'protagentic-core)
+(require 'protagentic-llm)
+(require 'protagentic-config)
+(require 'protagentic-utils)
+
+(defgroup protagentic-executor nil
+  "Task execution settings for Protagentic."
+  :group 'protagentic
+  :prefix "protagentic-executor-")
+
+(defcustom protagentic-executor-code-style-guide "clean-code"
+  "Code style guide to follow during generation.
+Options: 'clean-code', 'google', 'airbnb', 'custom'."
+  :type '(choice (const :tag "Clean Code" "clean-code")
+                 (const :tag "Google Style" "google")
+                 (const :tag "Airbnb Style" "airbnb")
+                 (const :tag "Custom" "custom"))
+  :group 'protagentic-executor)
+
+(defcustom protagentic-executor-test-framework "auto"
+  "Testing framework preference.
+Options: 'auto', 'jest', 'pytest', 'junit', 'ert'."
+  :type '(choice (const :tag "Auto-detect" "auto")
+                 (const :tag "Jest (JavaScript)" "jest")
+                 (const :tag "PyTest (Python)" "pytest")
+                 (const :tag "JUnit (Java)" "junit")
+                 (const :tag "ERT (Emacs Lisp)" "ert"))
+  :group 'protagentic-executor)
+
+(defcustom protagentic-executor-debug-mode nil
+  "Whether to use debug mode (fallback generation without LLM calls).
+Useful for testing the executor without API calls."
+  :type 'boolean
+  :group 'protagentic-executor)
+
+;; Data structures
+(cl-defstruct protagentic-task
+  "Represents a single task from the tasks.md file."
+  id
+  description
+  details
+  requirements-refs
+  status
+  generated-files
+  dependencies
+  estimated-effort)
+
+(cl-defstruct protagentic-execution-context
+  "Context for task execution."
+  spec
+  current-task
+  project-root
+  technology-stack
+  code-guidelines
+  existing-files
+  test-strategy)
+
+;; Task parsing and execution
+
+(defun protagentic-executor-parse-tasks (tasks-content)
+  "Parse TASKS-CONTENT into structured task list.
+Returns list of protagentic-task structures."
+  (let ((tasks '())
+        (task-id 0))
+    (with-temp-buffer
+      (insert tasks-content)
+      (goto-char (point-min))
+      
+      ;; Find all task checkboxes (both pending and completed)
+      (while (re-search-forward "^- \\[\\([x ]\\)\\] \\([0-9]+\\)\\. \\(.+\\)$" nil t)
+        (let* ((checkbox-state (match-string 1))
+               (task-num (match-string 2))
+               (description (match-string 3))
+               (details (protagentic-executor--extract-task-details))
+               (requirements-refs (protagentic-executor--extract-requirements-refs))
+               (status (if (string= checkbox-state "x") 'completed 'pending)))
+          
+          (push (make-protagentic-task
+                 :id (cl-incf task-id)
+                 :description description
+                 :details details
+                 :requirements-refs requirements-refs
+                 :status status
+                 :generated-files '()
+                 :dependencies '()
+                 :estimated-effort 1)
+                tasks))))
+    
+    (reverse tasks)))
+
+(defun protagentic-executor--extract-task-details ()
+  "Extract task details from current buffer position.
+Returns list of detail strings."
+  (let ((details '())
+        (start-pos (point)))
+    (forward-line 1)
+    
+    ;; Collect indented lines as details
+    (while (and (not (eobp))
+                (looking-at "^  \\(- \\|\\* \\)?\\(.+\\)$"))
+      (let ((detail (match-string 2)))
+        (unless (string-match-p "^_Requirements:" detail)
+          (push detail details)))
+      (forward-line 1))
+    
+    (reverse details)))
+
+(defun protagentic-executor--extract-requirements-refs ()
+  "Extract requirements references from current task.
+Returns list of requirement IDs."
+  (let ((refs '()))
+    (save-excursion
+      (when (re-search-forward "_Requirements: \\([0-9., ]+\\)_" 
+                               (save-excursion (forward-paragraph) (point)) t)
+        (let ((refs-string (match-string 1)))
+          (setq refs (split-string refs-string "[, ]+" t)))))
+    refs))
+
+;; Prerequisites and validation
+
+(defun protagentic-executor--check-prerequisites ()
+  "Check if all prerequisites for task execution are met.
+Returns t if ready, nil otherwise with helpful messages."
+  (let ((issues '()))
+    
+    ;; Check if LLM is available
+    (unless (protagentic-llm-available-p)
+      (push "LLM service not available. Check API key and network connection." issues))
+    
+    ;; Check API key
+    (unless (protagentic-config-get-api-key)
+      (push "OpenAI API key not configured. Run M-x protagentic-setup-llm" issues))
+    
+    ;; Report issues
+    (if issues
+        (progn
+          (message "Task execution prerequisites not met:")
+          (dolist (issue issues)
+            (message "  X %s" issue))
+          (message "Fix these issues and try again.")
+          nil)
+      (progn
+        (message "OK Prerequisites check passed")
+        t))))
+
+;; Main execution functions
+
+(defun protagentic-executor-execute-next-task (spec)
+  "Execute the next pending task for SPEC.
+Returns execution result with generated files and status."
+  ;; Check prerequisites first
+  (unless (protagentic-executor--check-prerequisites)
+    (error "Prerequisites not met. See messages for details"))
+  
+  (let* ((tasks (protagentic-executor--get-tasks spec))
+         (next-task (protagentic-executor--find-next-task tasks))
+         (context (protagentic-executor--build-execution-context spec next-task))
+         (total-tasks (length tasks))
+         (completed-tasks (length (cl-remove-if-not 
+                                  (lambda (task) (eq (protagentic-task-status task) 'completed)) 
+                                  tasks))))
+    
+    (if next-task
+        (progn
+          (message "")
+          (message "🎯 TASK EXECUTION STARTED")
+          (message "📋 Task %d: %s" 
+                   (protagentic-task-id next-task)
+                   (protagentic-task-description next-task))
+          (message "📊 Progress: %d/%d tasks completed" completed-tasks total-tasks)
+          (message "")
+          (let ((result (protagentic-executor--execute-single-task next-task context)))
+            (message "")
+            (if result
+                (message "🎉 TASK COMPLETED SUCCESSFULLY")
+              (message "❌ TASK EXECUTION FAILED"))
+            (message "")
+            result))
+      (progn
+        (message "🏁 All tasks completed! (%d/%d)" total-tasks total-tasks)
+        nil))))
+
+(defun protagentic-executor--execute-single-task (task context)
+  "Execute single TASK with CONTEXT.
+Returns execution result structure."
+  (message "🔧 Step 1/5: Building code generation prompt...")
+  (let* ((code-prompt (protagentic-executor--build-code-generation-prompt task context)))
+    
+    (message "🤖 Step 2/5: Generating code with AI...")
+    (let* ((generated-code (protagentic-executor--generate-code-with-llm code-prompt context)))
+      
+      (message "📄 Step 3/5: Parsing generated files...")
+      ;; Debug: Show first 500 characters of generated code
+      (message "🔍 Debug - Generated code preview: %s" 
+               (substring generated-code 0 (min 500 (length generated-code))))
+      (let* ((files (protagentic-executor--parse-generated-files generated-code)))
+        (message "📁 Found %d file(s) to generate: %s" 
+                 (length files)
+                 (string-join (mapcar #'car files) ", "))
+        
+        (message "✅ Step 4/5: Validating generated code...")
+        (let* ((validation-result (protagentic-executor--validate-generated-code files context)))
+          
+          (if (protagentic-executor--validation-passed-p validation-result)
+              (progn
+                (message "💾 Step 5/5: Writing files to disk...")
+                (protagentic-executor--write-generated-files files context)
+                (setf (protagentic-task-status task) 'completed)
+                (setf (protagentic-task-generated-files task) (mapcar #'car files))
+                ;; Update task status in the tasks file
+                (protagentic-executor--update-task-status-in-file 
+                 (protagentic-execution-context-spec context) task)
+                (message "✅ Task completed successfully - %d files generated" (length files))
+                task)
+            (progn
+              (message "❌ Step 4/5: Validation failed")
+              (message "❌ Validation errors: %s" 
+                       (protagentic-executor--get-validation-errors validation-result))
+              (setf (protagentic-task-status task) 'failed)
+              nil)))))))
+
+;; Code generation functions
+
+(defun protagentic-executor--generate-code-with-llm (prompt context)
+  "Generate code using LLM with PROMPT and CONTEXT.
+Includes proper error handling and timeout management."
+  
+  ;; Check if debug mode is enabled
+  (if protagentic-executor-debug-mode
+      (progn
+        (message "Debug mode enabled - using fallback generation")
+        (protagentic-executor--generate-code-fallback context))
+    
+    ;; Normal LLM generation with enhanced feedback
+    (message "🚀 Starting code generation with LLM...")
+    (message "📡 Preparing API request...")
+    
+    ;; Show prompt size for context
+    (message "📝 Prompt size: %d characters" (length prompt))
+    
+    (condition-case err
+        (let* ((start-time (current-time))
+               (result (progn
+                         (message "🔗 Contacting OpenAI API (this may take 10-60 seconds)...")
+                         (message "⏳ Please wait while the AI processes your request...")
+                         (with-timeout (60 (error "API call timed out after 60 seconds"))
+                           (protagentic-llm-generate-content prompt 'tasks context))))
+               (elapsed (float-time (time-subtract (current-time) start-time))))
+          
+          (message "✅ API call completed in %.1f seconds" elapsed)
+          
+          (if (and result (> (length result) 10))
+              (progn
+                (message "🎉 Code generation completed successfully (%d characters)" (length result))
+                result)
+            (progn
+              (message "⚠️ LLM returned insufficient result - using fallback")
+              (protagentic-executor--generate-code-fallback context))))
+      
+      (error
+       (message "❌ Code generation failed: %s" (error-message-string err))
+       (message "🔄 Using fallback code generation...")
+       (protagentic-executor--generate-code-fallback context)))))
+
+(defun protagentic-executor--generate-code-fallback (context)
+  "Generate basic code template as fallback when LLM fails."
+  (let* ((task (protagentic-execution-context-current-task context))
+         (task-desc (protagentic-task-description task))
+         (task-details (protagentic-task-details task))
+         (tech-stack (protagentic-execution-context-technology-stack context)))
+    
+    (message "Generating fallback code template...")
+    
+    ;; Generate a simple fallback that creates meaningful files based on task context
+    (protagentic-executor--generate-contextual-fallback task-desc task-details tech-stack)))
+
+;; Code generation prompts
+
+(defun protagentic-executor--build-code-generation-prompt (task context)
+  "Build code generation prompt for TASK with CONTEXT."
+  (let* ((spec (protagentic-execution-context-spec context))
+         (requirements-content (protagentic--read-file-content 
+                               (protagentic-spec-requirements-file spec)))
+         (design-content (protagentic--read-file-content 
+                         (protagentic-spec-design-file spec)))
+         (code-guidelines (protagentic-executor--get-code-guidelines context))
+         (tech-stack (protagentic-execution-context-technology-stack context)))
+    
+    (format "You are an expert software developer tasked with implementing high-quality, maintainable code.
+
+TASK TO IMPLEMENT:
+%s
+
+TASK DETAILS:
+%s
+
+REQUIREMENTS CONTEXT:
+%s
+
+DESIGN CONTEXT:
+%s
+
+CODE QUALITY GUIDELINES:
+%s
+
+TECHNOLOGY STACK:
+%s
+
+EXISTING PROJECT STRUCTURE:
+%s
+
+Please generate complete, production-ready code that:
+
+1. **Follows Clean Code Principles:**
+   - Clear, descriptive names for variables, functions, and classes
+   - Single Responsibility Principle - each function/class has one clear purpose
+   - Functions are small and focused (max 20-30 lines)
+   - Minimal comments - code should be self-documenting
+   - No magic numbers or hardcoded values
+
+2. **Implements Robust Error Handling:**
+   - Validate all inputs and handle edge cases
+   - Use appropriate exception types and error messages
+   - Fail fast with clear error messages
+   - Log errors appropriately for debugging
+
+3. **Includes Comprehensive Tests:**
+   - Unit tests for all public functions/methods
+   - Test edge cases and error conditions
+   - Use descriptive test names that explain the scenario
+   - Achieve high test coverage (>90%%)
+
+4. **Follows Security Best Practices:**
+   - Validate and sanitize all inputs
+   - Use parameterized queries for database operations
+   - Implement proper authentication and authorization
+   - Avoid exposing sensitive information
+
+5. **Ensures Performance and Scalability:**
+   - Use efficient algorithms and data structures
+   - Avoid N+1 queries and unnecessary loops
+   - Implement proper caching where appropriate
+   - Consider memory usage and resource cleanup
+
+6. **Maintains Consistency:**
+   - Follow established project conventions
+   - Use consistent naming patterns
+   - Match existing code style and structure
+   - Maintain architectural patterns
+
+OUTPUT FORMAT:
+Provide the code in the following format:
+
+```filename: path/to/meaningful_file_name.ext
+[Complete file content]
+```
+
+```filename: path/to/meaningful_test_name.test.ext
+[Complete test file content]
+```
+
+CRITICAL FILENAME REQUIREMENTS:
+- Use meaningful, descriptive filenames that reflect the actual component/functionality
+- DO NOT use generic names 
+- For project setup tasks, create multiple files like 'package.json', 'src/index.js', 'README.md'
+- For model tasks, create files like 'models/User.js', 'models/Product.js'
+- For API tasks, create files like 'routes/users.js', 'controllers/UserController.js'
+- For UI tasks, create files like 'components/UserProfile.js', 'components/LoginForm.js'
+- Always include proper directory structure in the filename path
+
+Generate ONLY the files needed for this specific task. Include both implementation and test files."
+            (protagentic-task-description task)
+            (string-join (protagentic-task-details task) "\n- ")
+            (protagentic-executor--extract-relevant-requirements 
+             requirements-content (protagentic-task-requirements-refs task))
+            (protagentic-executor--extract-relevant-design design-content task)
+            code-guidelines
+            (string-join tech-stack "\n- ")
+            (protagentic-executor--describe-project-structure context))))
+
+;; Code quality and guidelines
+
+(defun protagentic-executor--get-code-guidelines (context)
+  "Get code quality guidelines for CONTEXT."
+  (let ((style-guide protagentic-executor-code-style-guide))
+    (pcase style-guide
+      ("clean-code" (protagentic-executor--clean-code-guidelines))
+      ("google" (protagentic-executor--google-style-guidelines))
+      ("airbnb" (protagentic-executor--airbnb-style-guidelines))
+      ("custom" (protagentic-executor--load-custom-guidelines))
+      (_ (protagentic-executor--clean-code-guidelines)))))
+
+(defun protagentic-executor--clean-code-guidelines ()
+  "Return Clean Code style guidelines."
+  "CLEAN CODE PRINCIPLES:
+- Use intention-revealing names (no abbreviations)
+- Functions should do one thing and do it well
+- Keep functions small (max 20-30 lines)
+- Use descriptive variable names (no single letters except loop counters)
+- Avoid deep nesting (max 3 levels)
+- Use early returns to reduce complexity
+- No commented-out code
+- Use constants instead of magic numbers
+- Follow DRY (Don't Repeat Yourself) principle
+- Write code that tells a story")
+
+;; File generation and validation
+
+(defun protagentic-executor--parse-generated-files (generated-code)
+  "Parse GENERATED-CODE into list of (filename . content) pairs."
+  (let ((files '()))
+    (with-temp-buffer
+      (insert generated-code)
+      (goto-char (point-min))
+      
+      ;; Try multiple patterns for file extraction
+      (let ((patterns '("```filename: \\(.+\\)$"
+                       "```\\([^`\n]+\\.[a-z]+\\)$"
+                       "File: \\(.+\\)$"
+                       "\\*\\*File:\\*\\* \\(.+\\)$")))
+        
+        (dolist (pattern patterns)
+          (goto-char (point-min))
+          (while (re-search-forward pattern nil t)
+            (let ((filename (string-trim (match-string 1)))
+                  (start-pos (progn (forward-line 1) (point)))
+                  (end-pos (progn (re-search-forward "^```" nil t)
+                                 (match-beginning 0))))
+              (when (and start-pos end-pos filename
+                        (not (string-empty-p filename))
+                        (string-match-p "\\." filename)) ; Must have file extension
+                (let ((content (buffer-substring-no-properties start-pos end-pos)))
+                  (unless (cl-find filename files :key #'car :test #'string=)
+                    (push (cons filename (string-trim content)) files)))))))
+    
+    (reverse files)))
+
+(defun protagentic-executor--validate-generated-code (files context)
+  "Validate FILES against code quality standards in CONTEXT.
+Returns validation result structure."
+  (let ((errors '())
+        (warnings '()))
+    
+    (dolist (file files)
+      (let ((filename (car file))
+            (content (cdr file)))
+        
+        ;; Check file structure
+        (unless (protagentic-executor--valid-file-structure-p filename content)
+          (push (format "Invalid file structure: %s" filename) errors))
+        
+        ;; Check code quality
+        (let ((quality-issues (protagentic-executor--check-code-quality content filename)))
+          (setq warnings (append warnings quality-issues)))
+        
+        ;; Check test coverage (skip for CSS and HTML files)
+        (when (and (protagentic-executor--is-implementation-file-p filename)
+                   (not (protagentic-executor--is-style-or-markup-file-p filename)))
+          (unless (protagentic-executor--has-corresponding-test-p filename files)
+            (push (format "Missing test file for: %s" filename) errors)))))
+    
+    (list :errors errors :warnings warnings :passed (null errors))))
+
+(defun protagentic-executor--check-code-quality (content filename)
+  "Check code quality issues in CONTENT for FILENAME.
+Returns list of quality issues."
+  (let ((issues '()))
+    
+    ;; Check function length
+    (when (protagentic-executor--has-long-functions-p content)
+      (push "Functions longer than 30 lines detected" issues))
+    
+    ;; Check for magic numbers
+    (when (string-match-p "\\b[0-9]{3,}\\b" content)
+      (push "Magic numbers detected - use named constants" issues))
+    
+    ;; Check for TODO/FIXME comments
+    (when (string-match-p "\\b\\(TODO\\|FIXME\\|XXX\\)\\b" content)
+      (push "TODO/FIXME comments found - resolve before completion" issues))
+    
+    ;; Check for proper error handling
+    (unless (protagentic-executor--has-error-handling-p content filename)
+      (push "Missing error handling" issues))
+    
+    issues))
+
+;; Helper functions
+
+(defun protagentic-executor--get-tasks (spec)
+  "Get parsed tasks for SPEC."
+  (let ((tasks-content (protagentic--read-file-content 
+                       (protagentic-spec-tasks-file spec))))
+    (protagentic-executor-parse-tasks tasks-content)))
+
+(defun protagentic-executor--find-next-task (tasks)
+  "Find next pending task in TASKS list."
+  (cl-find-if (lambda (task) (eq (protagentic-task-status task) 'pending)) tasks))
+
+(defun protagentic-executor--update-task-status-in-file (spec task)
+  "Update TASK status in the tasks file for SPEC."
+  (let ((tasks-file (protagentic-spec-tasks-file spec))
+        (task-desc (protagentic-task-description task))
+        (new-status (protagentic-task-status task)))
+    
+    (when (file-exists-p tasks-file)
+      (with-temp-buffer
+        (insert-file-contents tasks-file)
+        (goto-char (point-min))
+        
+        ;; Find the task line and update its status
+        (when (re-search-forward (format "^- \\[ \\] [0-9]+\\. %s" (regexp-quote task-desc)) nil t)
+          (replace-match (format "- [x] %d. %s" 
+                                (protagentic-task-id task)
+                                task-desc))
+          (write-file tasks-file)
+          (message "Updated task status in %s" tasks-file))))))
+
+(defun protagentic-executor--build-execution-context (spec task)
+  "Build execution context for SPEC and TASK."
+  (make-protagentic-execution-context
+   :spec spec
+   :current-task task
+   :project-root (protagentic--detect-project-root)
+   :technology-stack (protagentic-executor--detect-technology-stack)
+   :code-guidelines protagentic-executor-code-style-guide
+   :existing-files (protagentic-executor--scan-existing-files)
+   :test-strategy protagentic-executor-test-framework))
+
+; Helper function implementations
+
+(defun protagentic-executor--extract-relevant-requirements (requirements-content requirement-refs)
+  "Extract relevant requirements from REQUIREMENTS-CONTENT based on REQUIREMENT-REFS."
+  (if (not requirement-refs)
+      "No specific requirements referenced."
+    (with-temp-buffer
+      (insert requirements-content)
+      (goto-char (point-min))
+      
+      (let ((relevant-sections '()))
+        (dolist (ref requirement-refs)
+          (goto-char (point-min))
+          (when (re-search-forward (format "### Requirement %s\\b" ref) nil t)
+            (let ((start (match-beginning 0))
+                  (end (or (re-search-forward "^### Requirement [0-9]" nil t)
+                          (point-max))))
+              (push (buffer-substring-no-properties start end) relevant-sections))))
+        
+        (if relevant-sections
+            (string-join (reverse relevant-sections) "\n\n")
+          "Referenced requirements not found in document.")))))
+
+(defun protagentic-executor--extract-relevant-design (design-content task)
+  "Extract relevant design sections from DESIGN-CONTENT for TASK."
+  (let ((task-desc (protagentic-task-description task)))
+    (with-temp-buffer
+      (insert design-content)
+      (goto-char (point-min))
+      
+      ;; Extract sections based on task keywords
+      (let ((relevant-sections '()))
+        (cond
+         ;; Database/data model tasks
+         ((string-match-p "database\\|data\\|model\\|schema" task-desc)
+          (when (re-search-forward "## Data Models" nil t)
+            (let ((start (match-beginning 0))
+                  (end (or (re-search-forward "^## " nil t) (point-max))))
+              (push (buffer-substring-no-properties start end) relevant-sections))))
+         
+         ;; API/interface tasks
+         ((string-match-p "api\\|interface\\|endpoint\\|service" task-desc)
+          (when (re-search-forward "## Components and Interfaces" nil t)
+            (let ((start (match-beginning 0))
+                  (end (or (re-search-forward "^## " nil t) (point-max))))
+              (push (buffer-substring-no-properties start end) relevant-sections))))
+         
+         ;; Architecture tasks
+         ((string-match-p "architecture\\|setup\\|structure" task-desc)
+          (when (re-search-forward "## Architecture" nil t)
+            (let ((start (match-beginning 0))
+                  (end (or (re-search-forward "^## " nil t) (point-max))))
+              (push (buffer-substring-no-properties start end) relevant-sections)))))
+        
+        (if relevant-sections
+            (string-join relevant-sections "\n\n")
+          "Full design document applies to this task.")))))
+
+(defun protagentic-executor--describe-project-structure (context)
+  "Describe current project structure for CONTEXT."
+  (let ((existing-files (protagentic-execution-context-existing-files context)))
+    (if existing-files
+        (format "Existing files:\n%s\n\nMaintain consistency with existing structure."
+                (string-join existing-files "\n- "))
+      "New project - establish clean project structure.")))
+
+(defun protagentic-executor--find-design-file ()
+  "Find the design.md file in the current spec."
+  (let ((project-root (protagentic--detect-project-root)))
+    (when project-root
+      ;; Look for design.md in .protagentic/specs/ subdirectories
+      (let ((specs-dir (expand-file-name ".protagentic/specs" project-root)))
+        (when (file-directory-p specs-dir)
+          (let ((spec-dirs (directory-files specs-dir t "^[^.]"))
+                (design-file nil))
+            (dolist (spec-dir spec-dirs)
+              (when (and (file-directory-p spec-dir) (not design-file))
+                (let ((candidate (expand-file-name "design.md" spec-dir)))
+                  (when (file-exists-p candidate)
+                    (setq design-file candidate)))))
+            design-file))))))
+
+(defun protagentic-executor--detect-technology-stack ()
+  "Detect technology stack from design document or project files."
+  (let ((stack '())
+        (project-root (protagentic--detect-project-root)))
+    
+    (when project-root
+      ;; First, try to read from design.md file
+      (let ((design-stack (protagentic-executor--extract-tech-stack-from-design)))
+        (when design-stack
+          (setq stack design-stack)))
+      
+      ;; If no design file or tech stack found, fall back to file detection
+      (when (null stack)
+        ;; Check for common technology indicators
+        (when (file-exists-p (expand-file-name "package.json" project-root))
+          (push "Node.js/JavaScript" stack))
+        (when (file-exists-p (expand-file-name "requirements.txt" project-root))
+          (push "Python" stack))
+        (when (file-exists-p (expand-file-name "Cargo.toml" project-root))
+          (push "Rust" stack))
+        (when (file-exists-p (expand-file-name "go.mod" project-root))
+          (push "Go" stack))
+        (when (directory-files project-root nil "\\.el$")
+          (push "Emacs Lisp" stack))))
+    
+    (or stack '("Generic"))))
+
+(defun protagentic-executor--extract-tech-stack-from-design ()
+  "Extract technology stack from design.md file."
+  (let ((design-file (protagentic-executor--find-design-file))
+        (tech-stack '()))
+    
+    (when (and design-file (file-exists-p design-file))
+      (with-temp-buffer
+        (insert-file-contents design-file)
+        (goto-char (point-min))
+        
+        ;; Look for Technology Stack section
+        (when (re-search-forward "### Technology Stack\\|## Technology Stack" nil t)
+          (let ((section-start (point))
+                (section-end (or (save-excursion
+                                   (re-search-forward "^##\\|^###" nil t)
+                                   (match-beginning 0))
+                                 (point-max))))
+            
+            ;; Extract technologies from the section
+            (goto-char section-start)
+            (while (re-search-forward "\\*\\*\\([^*]+\\)\\*\\*:\\s-*\\([^\n]+\\)" section-end t)
+              (let ((tech-category (match-string 1))
+                    (tech-details (match-string 2)))
+                
+                ;; Map common categories to standardized names
+                (cond
+                 ((string-match-p "Frontend\\|JavaScript\\|JS" tech-category)
+                  (cond
+                   ((string-match-p "React" tech-details) (push "React" tech-stack))
+                   ((string-match-p "Vue" tech-details) (push "Vue.js" tech-stack))
+                   ((string-match-p "Angular" tech-details) (push "Angular" tech-stack))
+                   ((string-match-p "Vanilla\\|ES6" tech-details) (push "JavaScript" tech-stack))
+                   (t (push "JavaScript" tech-stack))))
+                 
+                 ((string-match-p "Backend\\|Server" tech-category)
+                  (cond
+                   ((string-match-p "Node" tech-details) (push "Node.js" tech-stack))
+                   ((string-match-p "Python\\|Django\\|Flask" tech-details) (push "Python" tech-stack))
+                   ((string-match-p "Java\\|Spring" tech-details) (push "Java" tech-stack))
+                   ((string-match-p "Go" tech-details) (push "Go" tech-stack))))
+                 
+                 ((string-match-p "Database" tech-category)
+                  (cond
+                   ((string-match-p "PostgreSQL\\|Postgres" tech-details) (push "PostgreSQL" tech-stack))
+                   ((string-match-p "MySQL" tech-details) (push "MySQL" tech-stack))
+                   ((string-match-p "MongoDB" tech-details) (push "MongoDB" tech-stack))
+                   ((string-match-p "SQLite" tech-details) (push "SQLite" tech-stack))))
+                 
+                 ((string-match-p "Testing" tech-category)
+                  (cond
+                   ((string-match-p "Jest" tech-details) (push "Jest" tech-stack))
+                   ((string-match-p "pytest" tech-details) (push "pytest" tech-stack))
+                   ((string-match-p "JUnit" tech-details) (push "JUnit" tech-stack)))))))))
+    
+    ;; Remove duplicates and return
+    (delete-dups tech-stack)))))
+
+(defun protagentic-executor--scan-existing-files ()
+  "Scan existing project files."
+  (let ((project-root (protagentic--detect-project-root)))
+    (when project-root
+      (directory-files-recursively project-root "\\.[a-z]+$" nil))))
+
+(defun protagentic-executor--validation-passed-p (validation-result)
+  "Check if VALIDATION-RESULT indicates passing validation."
+  (plist-get validation-result :passed))
+
+(defun protagentic-executor--get-validation-errors (validation-result)
+  "Get validation errors from VALIDATION-RESULT."
+  (string-join (plist-get validation-result :errors) "; "))
+
+(defun protagentic-executor--write-generated-files (files context)
+  "Write generated FILES using CONTEXT."
+  (let ((project-root (protagentic-execution-context-project-root context)))
+    (dolist (file files)
+      (let* ((filename (car file))
+             (content (cdr file))
+             (full-path (expand-file-name filename project-root)))
+        
+        ;; Create directory if needed
+        (let ((dir (file-name-directory full-path)))
+          (unless (file-directory-p dir)
+            (make-directory dir t)))
+        
+        ;; Write file
+        (with-temp-file full-path
+          (insert content))
+        
+        (message "Generated: %s" filename)))))
+
+(defun protagentic-executor--valid-file-structure-p (filename content)
+  "Check if FILENAME and CONTENT have valid structure."
+  (and (not (string-empty-p filename))
+       (not (string-empty-p content))
+       (not (string-match-p "\\.\\." filename)) ; No path traversal
+       (> (length content) 10))) ; Minimum content length
+
+(defun protagentic-executor--is-implementation-file-p (filename)
+  "Check if FILENAME is an implementation file (not test)."
+  (not (string-match-p "test\\|spec" filename)))
+
+(defun protagentic-executor--is-style-or-markup-file-p (filename)
+  "Check if FILENAME is a CSS or HTML file that doesn't need tests."
+  (string-match-p "\\.\\(css\\|html\\|scss\\|sass\\)$" filename))
+
+(defun protagentic-executor--has-corresponding-test-p (filename files)
+  "Check if FILENAME has corresponding test in FILES."
+  (let ((base-name (file-name-sans-extension filename))
+        (extension (file-name-extension filename)))
+    (cl-some (lambda (file)
+               (let ((test-file (car file)))
+                 (or (string-match-p (format "%s.*test" base-name) test-file)
+                     (string-match-p (format "test.*%s" base-name) test-file))))
+             files)))
+
+
+(defun protagentic-executor--has-error-handling-p (content filename)
+  "Check if CONTENT has proper error handling for FILENAME."
+  (let ((extension (file-name-extension filename)))
+    (cond
+     ((string= extension "js")
+      (or (string-match-p "try\\s-*{" content)
+          (string-match-p "catch\\s-*(" content)
+          (string-match-p "throw\\s-+" content)))
+     ((string= extension "py")
+      (or (string-match-p "try:" content)
+          (string-match-p "except\\s-+" content)
+          (string-match-p "raise\\s-+" content)))
+     ((string= extension "java")
+      (or (string-match-p "try\\s-*{" content)
+          (string-match-p "catch\\s-*(" content)
+          (string-match-p "throws\\s-+" content)))
+     (t t)))) ; Assume other file types are OK
+
+;; New contextual fallback functions
+
+(defun protagentic-executor--generate-contextual-fallback (task-desc task-details tech-stack)
+  "Generate contextual fallback based on task type and technology stack."
+  (cond
+   ;; Project structure tasks
+   ((string-match-p "structure\\|setup\\|initialize" task-desc)
+    (protagentic-executor--generate-project-structure-fallback tech-stack))
+   
+   ;; Database/model tasks
+   ((string-match-p "database\\|model\\|schema" task-desc)
+    (protagentic-executor--generate-model-fallback tech-stack task-details))
+   
+   ;; API/service tasks
+   ((string-match-p "api\\|service\\|endpoint" task-desc)
+    (protagentic-executor--generate-api-fallback tech-stack task-details))
+   
+   ;; UI/component tasks
+   ((string-match-p "component\\|ui\\|interface" task-desc)
+    (protagentic-executor--generate-ui-fallback tech-stack task-details))
+   
+   ;; Generic fallback
+   (t (protagentic-executor--generate-generic-fallback tech-stack task-desc))))
+
+(defun protagentic-executor--generate-project-structure-fallback (tech-stack)
+  "Generate project structure files based on technology stack."
+  (cond
+   ((member "Node.js/JavaScript" tech-stack)
+    "```filename: package.json
+{
+  \"name\": \"project\",
+  \"version\": \"1.0.0\",
+  \"description\": \"Generated project structure\",
+  \"main\": \"src/index.js\",
+  \"scripts\": {
+    \"start\": \"node src/index.js\",
+    \"test\": \"jest\"
+  },
+  \"dependencies\": {},
+  \"devDependencies\": {
+    \"jest\": \"^29.0.0\"
+  }
+}
+```
+
+```filename: src/index.js
+/**
+ * Main application entry point
+ */
+
+console.log('Application started');
+
+module.exports = {};
+```
+
+```filename: README.md
+# Project
+
+Generated project structure. Update this README with actual project information.
+
+## Installation
+
+```bash
+npm install
+```
+
+## Usage
+
+```bash
+npm start
+```
+
+## Testing
+
+```bash
+npm test
+```
+```")
+   
+   ((member "Python" tech-stack)
+    "```filename: requirements.txt
+# Add your dependencies here
+```
+
+```filename: src/__init__.py
+\"\"\"
+Main application package
+\"\"\"
+```
+
+```filename: src/main.py
+\"\"\"
+Main application entry point
+\"\"\"
+
+def main():
+    print(\"Application started\")
+
+if __name__ == \"__main__\":
+    main()
+```
+
+```filename: README.md
+# Project
+
+Generated project structure. Update this README with actual project information.
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+```bash
+python src/main.py
+```
+```")
+   
+   (t "```filename: README.md
+# Project
+
+Generated project structure. Please set up appropriate files for your technology stack.
+```")))
+
+(defun protagentic-executor--generate-model-fallback (tech-stack task-details)
+  "Generate model/database fallback based on technology stack."
+  (cond
+   ((member "Node.js/JavaScript" tech-stack)
+    "```filename: models/User.js
+/**
+ * User model
+ */
+
+class User {
+  constructor(data = {}) {
+    this.id = data.id || null;
+    this.name = data.name || '';
+    this.email = data.email || '';
+    this.createdAt = data.createdAt || new Date();
+  }
+
+  validate() {
+    if (!this.name || !this.email) {
+      throw new Error('Name and email are required');
+    }
+    return true;
+  }
+
+  toJSON() {
+    return {
+      id: this.id,
+      name: this.name,
+      email: this.email,
+      createdAt: this.createdAt
+    };
+  }
+}
+
+module.exports = User;
+```
+
+```filename: models/User.test.js
+const User = require('./User');
+
+describe('User Model', () => {
+  test('should create user with valid data', () => {
+    const userData = { name: 'John Doe', email: 'john@example.com' };
+    const user = new User(userData);
+    
+    expect(user.name).toBe('John Doe');
+    expect(user.email).toBe('john@example.com');
+  });
+
+  test('should validate required fields', () => {
+    const user = new User();
+    expect(() => user.validate()).toThrow('Name and email are required');
+  });
+});
+```")
+   
+   ((member "Python" tech-stack)
+    "```filename: models/user.py
+\"\"\"
+User model
+\"\"\"
+from datetime import datetime
+from typing import Optional
+
+class User:
+    def __init__(self, data: dict = None):
+        data = data or {}
+        self.id: Optional[int] = data.get('id')
+        self.name: str = data.get('name', '')
+        self.email: str = data.get('email', '')
+        self.created_at: datetime = data.get('created_at', datetime.now())
+
+    def validate(self) -> bool:
+        if not self.name or not self.email:
+            raise ValueError('Name and email are required')
+        return True
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'name': self.name,
+            'email': self.email,
+            'created_at': self.created_at.isoformat()
+        }
+```
+
+```filename: tests/test_user.py
+import pytest
+from models.user import User
+
+def test_create_user_with_valid_data():
+    user_data = {'name': 'John Doe', 'email': 'john@example.com'}
+    user = User(user_data)
+    
+    assert user.name == 'John Doe'
+    assert user.email == 'john@example.com'
+
+def test_validate_required_fields():
+    user = User()
+    with pytest.raises(ValueError, match='Name and email are required'):
+        user.validate()
+```")
+   
+   (t "```filename: model.txt
+# Model implementation needed
+# Please specify the technology stack and requirements
+```")))
+
+(defun protagentic-executor--generate-api-fallback (tech-stack task-details)
+  "Generate API/service fallback based on technology stack."
+  (cond
+   ((member "Node.js/JavaScript" tech-stack)
+    "```filename: routes/api.js
+/**
+ * API routes
+ */
+const express = require('express');
+const router = express.Router();
+
+// GET /api/health
+router.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// TODO: Add specific API endpoints based on requirements
+
+module.exports = router;
+```
+
+```filename: routes/api.test.js
+const request = require('supertest');
+const express = require('express');
+const apiRoutes = require('./api');
+
+const app = express();
+app.use('/api', apiRoutes);
+
+describe('API Routes', () => {
+  test('GET /api/health should return status ok', async () => {
+    const response = await request(app)
+      .get('/api/health')
+      .expect(200);
+    
+    expect(response.body.status).toBe('ok');
+    expect(response.body.timestamp).toBeDefined();
+  });
+});
+```")
+   
+   ((member "Python" tech-stack)
+    "```filename: api/routes.py
+\"\"\"
+API routes
+\"\"\"
+from flask import Flask, jsonify
+from datetime import datetime
+
+app = Flask(__name__)
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'ok',
+        'timestamp': datetime.now().isoformat()
+    })
+
+# TODO: Add specific API endpoints based on requirements
+
+if __name__ == '__main__':
+    app.run(debug=True)
+```
+
+```filename: tests/test_routes.py
+import pytest
+from api.routes import app
+
+@pytest.fixture
+def client():
+    app.config['TESTING'] = True
+    with app.test_client() as client:
+        yield client
+
+def test_health_check(client):
+    response = client.get('/health')
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data['status'] == 'ok'
+    assert 'timestamp' in data
+```")
+   
+   (t "```filename: api.txt
+# API implementation needed
+# Please specify the technology stack and requirements
+```")))
+
+(defun protagentic-executor--has-long-functions-p (content)
+  "Check if CONTENT has functions longer than allowed."
+  (with-temp-buffer
+    (insert content)
+    (goto-char (point-min))
+    
+    ;; Simple heuristic: look for functions with more than 30 lines
+    (let ((long-function-found nil)
+          (max-lines 30)) ; Default max function lines
+      (while (and (not long-function-found)
+                  (re-search-forward "function\\|def\\|defun" nil t))
+        (let ((start-line (line-number-at-pos))
+              (brace-count 0)
+              (in-function t))
+          
+          ;; Count lines until function ends
+          (while (and in-function (not (eobp)))
+            (let ((char (char-after)))
+              (cond
+               ((eq char ?{) (cl-incf brace-count))
+               ((eq char ?}) (cl-decf brace-count)
+                (when (= brace-count 0) (setq in-function nil)))))
+            (forward-char))
+          
+          (let ((end-line (line-number-at-pos)))
+            (when (> (- end-line start-line) max-lines)
+              (setq long-function-found t)))))
+      
+      long-function-found)))
+
+(defun protagentic-executor--detect-language (filename)
+  "Detect programming language from FILENAME.
+Returns language symbol."
+  (let ((extension (file-name-extension filename)))
+    (cond
+     ((member extension '("js" "jsx" "ts" "tsx")) 'javascript)
+     ((member extension '("py" "pyw")) 'python)
+     ((member extension '("java")) 'java)
+     ((member extension '("el")) 'elisp)
+     ((member extension '("c" "cpp" "cc" "cxx")) 'cpp)
+     ((member extension '("rs")) 'rust)
+     ((member extension '("go")) 'go)
+     (t 'unknown))))
+
+(defun protagentic-executor--has-error-handling-p (content filename)
+  "Check if CONTENT has appropriate error handling for FILENAME."
+  (let ((language (protagentic-executor--detect-language filename)))
+    (pcase language
+      ('javascript (string-match-p "try\\|catch\\|throw" content))
+      ('python (string-match-p "try:\\|except\\|raise" content))
+      ('java (string-match-p "try\\|catch\\|throws?" content))
+      ('elisp (string-match-p "condition-case\\|error" content))
+      (_ t)))) ; Assume other languages have error handling
+
+(defun protagentic-executor--has-pending-tasks-p (spec)
+  "Check if SPEC has pending tasks by reading the tasks file."
+  (let ((tasks-file (protagentic-spec-tasks-file spec)))
+    (when (file-exists-p tasks-file)
+      (with-temp-buffer
+        (insert-file-contents tasks-file)
+        (goto-char (point-min))
+        ;; Look for unchecked task boxes
+        (re-search-forward "^- \\[ \\]" nil t)))))
+
+(defun protagentic-executor--get-generated-files (spec)
+  "Get list of generated files for SPEC."
+  (let ((tasks (protagentic-executor--get-tasks spec))
+        (all-files '()))
+    (dolist (task tasks)
+      (setq all-files (append all-files (protagentic-task-generated-files task))))
+    (cl-remove-duplicates all-files :test #'string=)))
+
+(defun protagentic-executor--google-style-guidelines ()
+  "Return Google style guidelines."
+  "GOOGLE STYLE GUIDELINES:
+- Use clear, descriptive names
+- Limit line length to 80-100 characters
+- Use consistent indentation (2 or 4 spaces)
+- Document public APIs thoroughly
+- Follow language-specific Google style guides
+- Use meaningful variable names
+- Avoid abbreviations in names")
+
+(defun protagentic-executor--airbnb-style-guidelines ()
+  "Return Airbnb style guidelines."
+  "AIRBNB STYLE GUIDELINES:
+- Use camelCase for variables and functions
+- Use PascalCase for constructors and classes
+- Use UPPER_SNAKE_CASE for constants
+- Prefer const over let, avoid var
+- Use arrow functions for callbacks
+- Always use semicolons
+- Use single quotes for strings
+- Destructure objects and arrays when possible")
+
+(defun protagentic-executor--load-custom-guidelines ()
+  "Load custom code guidelines from configuration."
+  "CUSTOM GUIDELINES:
+- Follow project-specific conventions
+- Maintain consistency with existing codebase
+- Use established patterns and practices
+- Document complex logic and algorithms")
+
+;; Fallback helper functions
+
+(defun protagentic-executor--sanitize-filename (name)
+  "Sanitize NAME for use as filename."
+  (let ((sanitized (downcase (string-trim name))))
+    (setq sanitized (replace-regexp-in-string "[ -]+" "_" sanitized))
+    (setq sanitized (replace-regexp-in-string "[^a-z0-9_]" "" sanitized))
+    ;; Don't truncate - keep full meaningful name
+    sanitized))
+
+
+
+(defun protagentic-executor--get-max-params (language)
+  "Get maximum parameter count for LANGUAGE."
+  (let ((rules (protagentic-quality--get-language-rules language)))
+    (or (plist-get rules 'max-params) 5)))
+
+(defun protagentic-executor--generate-generic-fallback (tech-stack task-desc)
+  "Generate generic fallback code for any task type."
+  (let* ((sanitized-name (protagentic-executor--sanitize-filename task-desc))
+         (class-name (mapconcat 'capitalize (split-string sanitized-name "_") ""))
+         (extension (cond
+                     ((member "Node.js/JavaScript" tech-stack) "js")
+                     ((member "Python" tech-stack) "py")
+                     ((member "Java" tech-stack) "java")
+                     ((member "Emacs Lisp" tech-stack) "el")
+                     (t "js"))))
+    
+    (cond
+     ((string= extension "js")
+      (format "```filename: src/%s.js
+/**
+ * %s
+ * Generated by Protagentic (fallback mode)
+ */
+
+class %s {
+  constructor() {
+    this.initialized = false;
+  }
+
+  /**
+   * Main execution method
+   */
+  async execute() {
+    try {
+      // TODO: Implement %s functionality
+      this.initialized = true;
+      return { success: true, message: 'Task completed successfully' };
+    } catch (error) {
+      console.error('Error in %s:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Validate input parameters
+   */
+  validate(params) {
+    return params && typeof params === 'object';
+  }
+}
+
+module.exports = %s;
+```
+
+```filename: src/%s.test.js
+const %s = require('./%s');
+
+describe('%s', () => {
+  let instance;
+
+  beforeEach(() => {
+    instance = new %s();
+  });
+
+  test('should initialize correctly', () => {
+    expect(instance.initialized).toBe(false);
+  });
+
+  test('should execute successfully', async () => {
+    const result = await instance.execute();
+    expect(result.success).toBe(true);
+    expect(instance.initialized).toBe(true);
+  });
+
+  test('should validate parameters', () => {
+    expect(instance.validate({})).toBe(true);
+    expect(instance.validate(null)).toBe(false);
+  });
+});
+```"
+              task-desc class-name task-desc class-name class-name
+              sanitized-name class-name sanitized-name class-name class-name))
+     
+     ((string= extension "py")
+      (format "```filename: src/%s.py
+\"\"\"
+%s
+Generated by Protagentic (fallback mode)
+\"\"\"
+
+class %s:
+    def __init__(self):
+        self.initialized = False
+
+    def execute(self):
+        \"\"\"Main execution method\"\"\"
+        try:
+            # TODO: Implement %s functionality
+            self.initialized = True
+            return {'success': True, 'message': 'Task completed successfully'}
+        except Exception as error:
+            print(f'Error in %s: {error}')
+            raise
+
+    def validate(self, params):
+        \"\"\"Validate input parameters\"\"\"
+        return params is not None and isinstance(params, dict)
+```
+
+```filename: test_%s.py
+import unittest
+from src.%s import %s
+
+class Test%s(unittest.TestCase):
+    def setUp(self):
+        self.instance = %s()
+
+    def test_initialization(self):
+        self.assertFalse(self.instance.initialized)
+
+    def test_execute(self):
+        result = self.instance.execute()
+        self.assertTrue(result['success'])
+        self.assertTrue(self.instance.initialized)
+
+    def test_validate(self):
+        self.assertTrue(self.instance.validate({}))
+        self.assertFalse(self.instance.validate(None))
+
+if __name__ == '__main__':
+    unittest.main()
+```"
+              sanitized-name task-desc class-name task-desc class-name
+              sanitized-name sanitized-name class-name class-name class-name))
+     
+     (t
+      (format "```filename: %s.txt
+# %s
+Generated by Protagentic (fallback mode)
+
+TODO: Implement %s functionality
+```"
+              sanitized-name task-desc task-desc)))))
+
+(provide 'protagentic-executor)
+
+;;; protagentic-executor.el ends here

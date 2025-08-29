@@ -517,6 +517,58 @@ Returns the selected mode symbol."
                nil t nil nil (symbol-name protagentic-config-default-generation-mode)))
     protagentic-config-default-generation-mode))
 
+;; Code quality and execution configuration
+(defcustom protagentic-code-quality-standard "clean-code"
+  "Code quality standard to enforce during generation.
+Options: 'clean-code', 'google', 'airbnb', 'custom'."
+  :type '(choice (const :tag "Clean Code" "clean-code")
+                 (const :tag "Google Style" "google")
+                 (const :tag "Airbnb Style" "airbnb")
+                 (const :tag "Custom" "custom"))
+  :group 'protagentic-config)
+
+(defcustom protagentic-enforce-test-coverage t
+  "Whether to enforce test coverage requirements."
+  :type 'boolean
+  :group 'protagentic-config)
+
+(defcustom protagentic-min-test-coverage 90
+  "Minimum test coverage percentage required."
+  :type 'integer
+  :group 'protagentic-config)
+
+(defcustom protagentic-auto-validate-quality t
+  "Whether to automatically validate code quality after generation."
+  :type 'boolean
+  :group 'protagentic-config)
+
+(defcustom protagentic-max-function-lines 30
+  "Maximum lines allowed in a single function."
+  :type 'integer
+  :group 'protagentic-config)
+
+(defcustom protagentic-enforce-naming-conventions t
+  "Whether to enforce naming conventions."
+  :type 'boolean
+  :group 'protagentic-config)
+
+;; Configuration getters for new features
+(defun protagentic-config-get-code-quality-standard ()
+  "Get the configured code quality standard."
+  protagentic-code-quality-standard)
+
+(defun protagentic-config-get-test-coverage-requirement ()
+  "Get the minimum test coverage requirement."
+  protagentic-min-test-coverage)
+
+(defun protagentic-config-should-auto-validate-quality ()
+  "Check if automatic quality validation is enabled."
+  protagentic-auto-validate-quality)
+
+(defun protagentic-config-should-enforce-test-coverage ()
+  "Check if test coverage enforcement is enabled."
+  protagentic-enforce-test-coverage)
+
 (provide 'protagentic-config)
 
 ;;; protagentic-config.el ends here

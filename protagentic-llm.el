@@ -154,23 +154,43 @@ Returns a protagentic-llm-response structure."
            (url-request-data (protagentic-llm--create-request-body 
                              prompt model max-tokens temperature))
            (url (concat protagentic-llm-api-base-url "/chat/completions"))
-           (response-buffer nil))
+           (response-buffer nil)
+           (model-name (or model protagentic-llm-default-model))
+           (request-size (length url-request-data)))
+      
+      (message "🔧 Using model: %s" model-name)
+      (message "📊 Request payload: %d bytes" request-size)
+      (message "🌐 Sending request to: %s" url)
       
       (condition-case err
           (progn
-            (setq response-buffer (url-retrieve-synchronously url nil nil protagentic-llm-request-timeout))
+            (message "📡 Making HTTP request...")
+            (let ((start-time (current-time)))
+              (setq response-buffer (url-retrieve-synchronously url nil nil protagentic-llm-request-timeout))
+              (let ((request-time (float-time (time-subtract (current-time) start-time))))
+                (message "📥 HTTP response received (%.1fs)" request-time)))
+            
             (if response-buffer
-                (let ((parsed-response (protagentic-llm--parse-response response-buffer)))
-                  (kill-buffer response-buffer)
-                  parsed-response)
-              (make-protagentic-llm-response
-               :content nil
-               :tokens-used 0
-               :model nil
-               :finish-reason nil
-               :error "Request timeout or connection failed"
-               :timestamp (current-time))))
+                (progn
+                  (message "🔍 Parsing API response...")
+                  (let ((parsed-response (protagentic-llm--parse-response response-buffer)))
+                    (kill-buffer response-buffer)
+                    (if (protagentic-llm-response-error parsed-response)
+                        (message "❌ API returned error: %s" (protagentic-llm-response-error parsed-response))
+                      (message "✅ Response parsed successfully - %d tokens used" 
+                               (or (protagentic-llm-response-tokens-used parsed-response) 0)))
+                    parsed-response))
+              (progn
+                (message "❌ No response received from API")
+                (make-protagentic-llm-response
+                 :content nil
+                 :tokens-used 0
+                 :model nil
+                 :finish-reason nil
+                 :error "Request timeout or connection failed"
+                 :timestamp (current-time)))))
         (error
+         (message "❌ Request failed with error: %s" (error-message-string err))
          (when response-buffer
            (kill-buffer response-buffer))
          (make-protagentic-llm-response
@@ -188,6 +208,7 @@ Returns a protagentic-llm-response structure."
 CONTENT-TYPE should be one of 'requirements, 'design, or 'tasks.
 CONTEXT is optional additional context information.
 Returns the generated content as a string or nil on error."
+  (message "🔧 Preparing LLM request...")
   (let* ((request (make-protagentic-llm-request
                    :prompt prompt
                    :model protagentic-llm-default-model
@@ -195,20 +216,27 @@ Returns the generated content as a string or nil on error."
                    :temperature protagentic-llm-default-temperature
                    :context context
                    :type content-type
-                   :timestamp (current-time)))
-         (response (protagentic-llm--make-request 
-                   (protagentic-llm-request-prompt request)
-                   (protagentic-llm-request-model request)
-                   (protagentic-llm-request-max-tokens request)
-                   (protagentic-llm-request-temperature request))))
+                   :timestamp (current-time))))
     
-    (if (protagentic-llm-response-error response)
+    (message "📡 Making API request...")
+    (let* ((response (protagentic-llm--make-request 
+                     (protagentic-llm-request-prompt request)
+                     (protagentic-llm-request-model request)
+                     (protagentic-llm-request-max-tokens request)
+                     (protagentic-llm-request-temperature request))))
+      
+      (if (protagentic-llm-response-error response)
+          (progn
+            (message "❌ LLM generation failed: %s" (protagentic-llm-response-error response))
+            nil)
         (progn
-          (message "LLM generation failed: %s" (protagentic-llm-response-error response))
-          nil)
-      (let ((raw-content (protagentic-llm-response-content response)))
-        ;; Parse and format the response
-        (protagentic-llm--parse-and-format-content raw-content content-type)))))
+          (message "🔄 Processing LLM response...")
+          (let ((raw-content (protagentic-llm-response-content response)))
+            (message "📝 Raw response length: %d characters" (length raw-content))
+            ;; Parse and format the response
+            (let ((formatted-content (protagentic-llm--parse-and-format-content raw-content content-type)))
+              (message "✅ Content formatting completed")
+              formatted-content)))))))
 
 (defun protagentic-llm-validate-credentials ()
   "Validate OpenAI API credentials.

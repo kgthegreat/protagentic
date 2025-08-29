@@ -336,7 +336,7 @@ When t, Protagentic will attempt to integrate with:
     
     (t (protagentic--sanitize-spec-name name))))
 
-;; Load submodules
+;; Load core submodules
 (require 'protagentic-core)
 (require 'protagentic-utils)
 (require 'protagentic-templates)
@@ -346,6 +346,8 @@ When t, Protagentic will attempt to integrate with:
 (require 'protagentic-llm)
 (require 'protagentic-generator)
 (require 'protagentic-prompts)
+
+;; Note: protagentic-executor and protagentic-quality are loaded on-demand
 
 ;; Menu integration
 (defvar protagentic-menu-map
@@ -370,6 +372,23 @@ When t, Protagentic will attempt to integrate with:
     (define-key map [protagentic-generate-tasks]
       '(menu-item "Generate Tasks" protagentic-generate-tasks
                   :help "Generate implementation tasks"))
+    
+    (define-key map [protagentic-execute-next-task]
+      '(menu-item "Execute Next Task" protagentic-execute-next-task
+                  :help "Execute the next pending implementation task"))
+    
+    (define-key map [protagentic-execute-all-tasks]
+      '(menu-item "Execute All Tasks" protagentic-execute-all-tasks
+                  :help "Execute all pending implementation tasks"))
+    
+    (define-key map [protagentic-show-task-status]
+      '(menu-item "Show Task Status" protagentic-show-task-status
+                  :help "Show task execution status"))
+    
+    (define-key map [protagentic-validate-code-quality]
+      '(menu-item "Validate Code Quality" protagentic-validate-code-quality
+                  :help "Validate generated code quality"))
+    
     (define-key map [separator-3] '("--"))
     (define-key map [protagentic-show-config]
       '(menu-item "Show Configuration" protagentic-show-config
@@ -528,6 +547,8 @@ When t, Protagentic will attempt to integrate with:
   "Regenerate tasks document for the current spec with mode selection."
   (interactive)
   (protagentic-commands-regenerate-tasks))
+
+;; New commands are defined in protagentic-commands.el and autoloaded from there
 
 (provide 'protagentic)
 

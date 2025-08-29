@@ -348,6 +348,14 @@ Uses safe file writing with enhanced error handling."
 Uses safe file reading with enhanced error handling."
   (protagentic--safe-read-file file-path))
 
+(defun protagentic--read-spec-name (prompt)
+  "Read spec name from user with PROMPT.
+Returns spec name string or signals error if no specs available."
+  (let ((available-specs (protagentic--get-project-specs)))
+    (if available-specs
+        (completing-read prompt available-specs nil t)
+      (user-error "No specs found in current project"))))
+
 (provide 'protagentic-utils)
 
 ;;; protagentic-utils.el ends here
